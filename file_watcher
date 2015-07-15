@@ -1,0 +1,145 @@
+#!/bin/bash
+
+FIFO_QUEUE="/tmp/inotifywait.log"
+INOTIFYWAIT=`which inotifywait`
+EVENTS="move,create,delete,delete_self,unmount,modify"
+WATCH_DIRS=("/home/andy/AmazonCloudPusher/testdir")
+MAX_WATCHES=`cat /proc/sys/fs/inotify/max_user_watches`
+LIBS_DIR="libs"
+INOTIFY_OPTS=("--daemon" "--recursive" "--quiet" "--timefmt %H%M%S" "--format %w,%f,%e,%T" "-o $FIFO_QUEUE")
+INOTIFY_PID=
+
+# Set script directory
+DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+LIBS_DIR="$DIR/libs"
+
+### Load external libraries ##
+source "$LIBS_DIR/task-logger/task-logger.sh"
+if [ $? -ne 0 ]; then
+  error "can't find task-logger.sh in $LIBS_DIR/task-logger"
+  exit 127 
+fi
+
+source "$LIBS_DIR/redis-bash/redis-bash-lib"
+if [ $? -ne 0 ]; then
+  error "can't find redis-bash-lib in $LIBS_DIR/redis-bash"
+  exit 127 
+fi
+
+# Read the config file (if it exists)
+if [ -f "$DIR/config" ]; then
+  source "$DIR/config" 2> /dev/null
+fi
+
+# Read command line Options
+while getopts ":h:p:r:c:" opt
+do
+    case ${opt} in
+        h) REDISHOST=${OPTARG};;
+        p) REDISPORT=${OPTARG};;
+        r) WATCH_DIR=${OPTARG};;
+        c) CHANNEL=${OPTARG};;
+    esac
+done
+shift $((${OPTIND} - 1))
+
+function exit_handler () {
+  if [ -p "$FIFO_QUEUE" ]; then
+    rm "$FIFO_QUEUE"
+  fi
+  if [ "$INOTIFY_PID" != "" ] && ps -p $INOTIFY_PID > /dev/null; then
+    kill -9 $INOTIFY_PID
+  fi
+}
+
+function check_dependencies () {
+  if [ $INOTIFYWAIT == "" ]; then
+    error "inotifywait is not installed, it is required"
+    info "Install it using the following:"
+    info "  apt-get inotify-tools"
+    exit 1
+  fi
+}
+
+# Array Helper
+function containsElement () {
+  local e
+  for e in "${@:2}"; do [[ "$e" == "$1" ]] && return 0; done
+  return 1
+}
+
+function create_fifo_queue () {
+  # Create named pipe (if not exists)
+  if [ ! -p "$FIFO_QUEUE" ]; then 
+    mkfifo "$FIFO_QUEUE"
+    return $?
+  fi
+  return 0
+}
+
+function open_redis_connection () {
+# Open the connection
+exec 5>&-
+if [ "${REDISHOST}" != "" ] && [ "${REDISPORT}" != "" ]; then
+  exec 5<>/dev/tcp/${REDISHOST}/${REDISPORT} # open fd
+  if [ $? -ne 0 ]; then
+    error "Invalid Redis Connection Info $REDISHOST:$REDISPORT"
+    bad $RESULT
+    exit 255
+  fi
+else
+  error "Invalid Redis Connection Info $REDISHOST:$REDISPORT"
+  exit 255
+fi
+return $?
+}
+
+function diff_directories () {
+  #comm -23 <(ls $1 |sort) <(ls $2 |sort)
+}
+
+trap exit_handler EXIT
+trap exit_handler INT
+check_dependencies
+create_fifo_queue
+open_redis_connection
+
+#info "${INOTIFY_OPTS[@]} -e $EVENTS ${WATCH_DIRS[@]}"
+"$INOTIFYWAIT" ${INOTIFY_OPTS[@]} -e $EVENTS ${WATCH_DIRS[@]}
+INOTIFY_PID=`ps -ax | grep "$INOTIFYWAIT" | grep -v grep | head -n 1 | awk '{print $1}'`
+
+if [ $? -ne 0 ]; then
+  error "inotify failed to start!"
+  bad "$OUTPUT"
+  exit 0
+fi
+
+good "Ready to receive file events"
+
+last_tm=""
+trap "true" PIPE
+
+cat "$FIFO_QUEUE" | while IFS=, read -r path file event time; do
+  SUBSCRIBER_COUNT=`redis-client 5 PUBLISH "$CHANNEL" "$path,$file,$event"`
+  CODE=$? 
+  if [ $CODE -eq 0 ]; then
+    info "Published $event for $file"
+  else
+    bad "Failed to publish $event for $file error $CODE"
+  fi
+done
+  #if [[ "$tm" == "$last_tm" ]]; then
+  #  continue
+  #fi
+  #last_tm=$tm
+  #current=$(date +'%H%M%S')
+  #echo "$file" "$path" "$event" "$tm"
+  #delta=`expr $current - $tm`
+  #if [ $delta -lt 2 -a $delta -gt -2 ]; then
+  #  sleep 2
+  #  info ${file} ${event} ${tm}
+  #fi
+#done
+trap PIPE
+
+exec 6>&- # close the connection

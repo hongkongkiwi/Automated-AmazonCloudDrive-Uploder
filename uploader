@@ -1,0 +1,63 @@
+#!/bin/bash
+# Set script directory
+DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+
+source libs/redis-bash/redis-bash-lib 2> /dev/null
+if [ $? -ne 0 ]; then
+  echo "can't find redis-bash-lib in /usr/share/redis-bash or ${LIBFOLDER}"
+  exit 127 
+fi
+
+# Read the config file (if it exists)
+if [ -f "$DIR/config" ]; then
+  source "$DIR/config" 2> /dev/null
+fi
+
+# Read command line Options
+while getopts ":h:p:r:c:" opt
+do
+    case ${opt} in
+        h) REDISHOST=${OPTARG};;
+        p) REDISPORT=${OPTARG};;
+	r) REMOTE_PATH=${OPTARG};;
+	c) CHANNEL=${OPTARG};;
+    esac
+done
+shift $((${OPTIND} - 1))
+
+if [[ "$CHANNEL" == "" ]]; then
+	echo "No channel set!"
+	exit 1
+fi
+
+echo "Channel: $CHANNEL"
+echo "Server: $REDISHOST:$REDISPORT"
+
+while true
+do
+    exec 5>&-
+    if [ "${REDISHOST}" != "" ] && [ "${REDISPORT}" != "" ]
+    then
+        exec 5<>/dev/tcp/${REDISHOST}/${REDISPORT} # open fd
+    else
+        echo "Wrong arguments"
+        exit 255
+    fi
+    redis-client 5 SUBSCRIBE "${CHANNEL}" > /dev/null # subscribe to the pubsub channel in fd 5
+    while true
+    do
+        unset ARGV
+        OFS=${IFS};IFS=$'\n' # split the return correctly
+        ARGV=($(redis-client 5))
+	IFS='?'
+        if [ "${ARGV[0]}" = "message" ] && [ "${ARGV[1]}" = "${CHANNEL}" ]; then
+	    CHANGED=(${ARGV[2]})
+	    REMOTE=${CHANGED[0]#$WATCH_DIR}
+            echo "acd_cli upload ${CHANGED[0]} $REMOTE_PATH/$REMOTE"
+        elif [ -z ${ARGV} ]; then
+            sleep 1
+            break
+        fi
+        IFS=${OFS}
+    done
+done
